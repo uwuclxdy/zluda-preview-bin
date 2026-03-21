@@ -1,5 +1,5 @@
 pkgbase = zluda-preview-bin
-	pkgdesc = CUDA on AMD GPUs — preview pre-built binary
+	pkgdesc = CUDA on AMD GPUs (pre-release ZLUDA binary).
 	pkgver = 6.preview.62
 	pkgrel = 1
 	url = https://github.com/vosen/ZLUDA
