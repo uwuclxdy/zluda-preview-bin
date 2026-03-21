@@ -1,0 +1,77 @@
+name: Update zluda-preview-bin
+
+on:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for new pre-release
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          release=$(curl -fsSL \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/vosen/ZLUDA/releases" \
+            | jq -r '[.[] | select(.prerelease)][0]')
+
+          tag=$(echo "$release" | jq -r '.tag_name')
+
+          if [[ -z "$tag" || "$tag" == "null" ]]; then
+            echo "No pre-releases found upstream"
+            echo "update=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          asset_url=$(echo "$release" | jq -r \
+            '.assets[] | select(.name | test("linux")) | .browser_download_url')
+          commit=$(echo "$asset_url" | grep -oP '(?<=zluda-linux-)[a-f0-9]+')
+          new_ver=$(echo "$tag" | sed 's/^v//; s/-/./g')
+          cur_ver=$(grep '^pkgver=' PKGBUILD | cut -d= -f2)
+
+          if [[ "$new_ver" == "$cur_ver" ]]; then
+            echo "Already at latest pre-release ($cur_ver)"
+            echo "update=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "New version found: $new_ver"
+            echo "update=true"    >> "$GITHUB_OUTPUT"
+            echo "tag=$tag"       >> "$GITHUB_OUTPUT"
+            echo "commit=$commit" >> "$GITHUB_OUTPUT"
+            echo "asset=$asset_url" >> "$GITHUB_OUTPUT"
+            echo "ver=$new_ver"   >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Compute checksum
+        if: steps.check.outputs.update == 'true'
+        id: sum
+        run: |
+          curl -fsSL "${{ steps.check.outputs.asset }}" -o tarball.tar.gz
+          echo "sha=$(sha256sum tarball.tar.gz | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+
+      - name: Update PKGBUILD
+        if: steps.check.outputs.update == 'true'
+        run: |
+          sed -i "s/^pkgver=.*/pkgver=${{ steps.check.outputs.ver }}/"        PKGBUILD
+          sed -i "s/^pkgrel=.*/pkgrel=1/"                                     PKGBUILD
+          sed -i "s/^_tag=.*/_tag=${{ steps.check.outputs.tag }}/"            PKGBUILD
+          sed -i "s/^_commit=.*/_commit=${{ steps.check.outputs.commit }}/"   PKGBUILD
+          sed -i "s|sha256sums=('[^']*'|sha256sums=('${{ steps.sum.outputs.sha }}'|" PKGBUILD
+
+      - name: Publish to AUR
+        if: steps.check.outputs.update == 'true'
+        uses: KSXGitHub/github-actions-deploy-aur@v4.1.1
+        with:
+          pkgname: zluda-preview-bin
+          pkgbuild: ./PKGBUILD
+          commit_username: ${{ vars.AUR_USERNAME }}
+          commit_email: ${{ vars.AUR_EMAIL }}
+          ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          commit_message: 'upgpkg: ${{ steps.check.outputs.ver }}'
+          allow_empty_commits: false
+          force_push: true
