@@ -68,8 +68,8 @@ jobs:
       - name: Regenerate .SRCINFO
         if: steps.check.outputs.update == 'true'
         run: |
-          docker run --rm -v "$PWD:/pkg" -w /pkg archlinux:latest \
-            bash -c "makepkg --printsrcinfo > .SRCINFO"
+          docker run --rm -v "$PWD:/pkg" archlinux:latest \
+            bash -c "useradd builder && chown builder /pkg && su builder -c 'cd /pkg && makepkg --printsrcinfo > .SRCINFO'"
 
       - name: Commit and push to GitHub
         if: steps.check.outputs.update == 'true'
