@@ -8,6 +8,8 @@ on:
 jobs:
   update:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -62,6 +64,21 @@ jobs:
           sed -i "s/^_tag=.*/_tag=${{ steps.check.outputs.tag }}/"            PKGBUILD
           sed -i "s/^_commit=.*/_commit=${{ steps.check.outputs.commit }}/"   PKGBUILD
           sed -i "s|sha256sums=('[^']*'|sha256sums=('${{ steps.sum.outputs.sha }}'|" PKGBUILD
+
+      - name: Regenerate .SRCINFO
+        if: steps.check.outputs.update == 'true'
+        run: |
+          docker run --rm -v "$PWD:/pkg" -w /pkg archlinux:latest \
+            bash -c "makepkg --printsrcinfo > .SRCINFO"
+
+      - name: Commit and push to GitHub
+        if: steps.check.outputs.update == 'true'
+        run: |
+          git config user.name "${{ vars.AUR_USERNAME }}"
+          git config user.email "${{ vars.AUR_EMAIL }}"
+          git add PKGBUILD .SRCINFO
+          git commit -m "upgpkg: ${{ steps.check.outputs.ver }}"
+          git push
 
       - name: Publish to AUR
         if: steps.check.outputs.update == 'true'
