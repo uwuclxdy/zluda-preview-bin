@@ -1,4 +1,4 @@
-name: Update zluda-preview-bin
+name: Update AUR Package
 
 on:
   schedule:
