@@ -1,3 +1,6 @@
+# Third-party Actions are SHA-pinned because this workflow holds an AUR push credential:
+# a tag pin (`@v6`) lets a compromised upstream tag exfiltrate the secret.
+
 name: Update AUR Package
 
 on:
@@ -8,100 +11,188 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: update-aur
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
 jobs:
   update:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      # `ref` resolves the branch tip at checkout time. Without it a re-run replays the run's
+      # pinned head_sha, rebuilds a commit the successful attempt already pushed, and the
+      # push comes back non-fast-forward.
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+        with:
+          ref: ${{ github.ref_name }}
+          # Full history: the push step rebases on conflict, which a depth-1 clone cannot do.
+          fetch-depth: 0
 
       - name: Check for new pre-release
         id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          release=$(curl -sL \
-            "https://api.github.com/repos/vosen/ZLUDA/releases" \
-            | jq -r '[.[] | select(.prerelease)][0]')
+          set -Eeuo pipefail
+          # Authenticated read raises the anon 60 req/hr/IP cap that shared runners share.
+          release=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/vosen/ZLUDA/releases?per_page=30" \
+            | jq -e '[.[] | select(.prerelease)][0]')
 
-          tag=$(echo "$release" | jq -r '.tag_name')
+          tag=$(jq -er .tag_name <<<"$release")
+          asset=$(jq -er '.assets[] | select(.name | test("linux")) | .browser_download_url' \
+            <<<"$release" | head -1)
+          commit=$(grep -oP '(?<=zluda-linux-)[a-f0-9]+' <<<"$asset" | head -1)
+          ver="${tag#v}"; ver="${ver//-/.}"
 
-          if [[ -z "$tag" || "$tag" == "null" ]]; then
-            echo "No pre-releases found upstream"
-            echo "update=false" >> "$GITHUB_OUTPUT"
-            exit 0
+          # Shape gates: a malformed upstream tag must fail here rather than land in a
+          # PKGBUILD that gets pushed to the AUR. They also keep sed metacharacters out.
+          if ! [[ "$tag" =~ ^[0-9A-Za-z._-]+$ ]]; then
+            echo "::error::rejected upstream tag '$tag'"; exit 1
+          fi
+          if ! [[ "$ver" =~ ^[0-9]+(\.[0-9A-Za-z]+)*$ ]]; then
+            echo "::error::rejected derived pkgver '$ver'"; exit 1
+          fi
+          if ! [[ "$commit" =~ ^[0-9a-f]{7,40}$ ]]; then
+            echo "::error::rejected commit hash '$commit' from asset '$asset'"; exit 1
           fi
 
-          asset_url=$(echo "$release" | jq -r \
-            '.assets[] | select(.name | test("linux")) | .browser_download_url')
-          commit=$(echo "$asset_url" | grep -oP '(?<=zluda-linux-)[a-f0-9]+')
-          new_ver=$(echo "$tag" | sed 's/^v//; s/-/./g')
-          cur_ver=$(grep '^pkgver=' PKGBUILD | cut -d= -f2)
-
-          if [[ "$new_ver" == "$cur_ver" ]]; then
-            echo "Already at latest pre-release ($cur_ver)"
+          cur=$(grep '^pkgver=' PKGBUILD | cut -d= -f2)
+          if [[ "$ver" == "$cur" ]]; then
+            echo "PKGBUILD already at $cur"
             echo "update=false" >> "$GITHUB_OUTPUT"
           else
-            echo "New version found: $new_ver"
+            echo "new pre-release: $ver (was $cur)"
             echo "update=true"    >> "$GITHUB_OUTPUT"
             echo "tag=$tag"       >> "$GITHUB_OUTPUT"
             echo "commit=$commit" >> "$GITHUB_OUTPUT"
-            echo "asset=$asset_url" >> "$GITHUB_OUTPUT"
-            echo "ver=$new_ver"   >> "$GITHUB_OUTPUT"
+            echo "ver=$ver"       >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Compute checksum
+      - name: Bump PKGBUILD
         if: steps.check.outputs.update == 'true'
-        id: sum
+        env:
+          VER:    ${{ steps.check.outputs.ver }}
+          TAG:    ${{ steps.check.outputs.tag }}
+          COMMIT: ${{ steps.check.outputs.commit }}
         run: |
-          curl -fsSL "${{ steps.check.outputs.asset }}" -o tarball.tar.gz
-          echo "sha=$(sha256sum tarball.tar.gz | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          set -Eeuo pipefail
+          # Values arrive via env, never via ${{ }} interpolated into the script body.
+          sed -i "s|^pkgver=.*|pkgver=$VER|"     PKGBUILD
+          sed -i "s|^pkgrel=.*|pkgrel=1|"        PKGBUILD
+          sed -i "s|^_tag=.*|_tag=$TAG|"         PKGBUILD
+          sed -i "s|^_commit=.*|_commit=$COMMIT|" PKGBUILD
 
-      - name: Update PKGBUILD
-        if: steps.check.outputs.update == 'true'
-        run: |
-          sed -i "s/^pkgver=.*/pkgver=${{ steps.check.outputs.ver }}/"        PKGBUILD
-          sed -i "s/^pkgrel=.*/pkgrel=1/"                                     PKGBUILD
-          sed -i "s/^_tag=.*/_tag=${{ steps.check.outputs.tag }}/"            PKGBUILD
-          sed -i "s/^_commit=.*/_commit=${{ steps.check.outputs.commit }}/"   PKGBUILD
-          sed -i "s|sha256sums=('[^']*'|sha256sums=('${{ steps.sum.outputs.sha }}'|" PKGBUILD
-
-      - name: Regenerate .SRCINFO
+      - name: Refresh checksums + .SRCINFO
         if: steps.check.outputs.update == 'true'
         run: |
-          docker run --rm -v "$PWD:/pkg" -w /pkg \
-            --user "$(id -u):$(id -g)" -e HOME=/tmp \
-            archlinux:latest \
-            bash -c "makepkg --printsrcinfo > .SRCINFO"
+          set -Eeuo pipefail
+          # updpkgsums re-hashes every source. Hand-computing only the tarball leaves the
+          # per-tag LICENSE-MIT hash stale the first time upstream touches that file.
+          docker run --rm -i -v "$PWD:/pkg" -w /pkg \
+            -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+            archlinux:latest bash -Eeuo pipefail -s <<'CTR'
+          pacman -Syu --noconfirm --needed pacman-contrib >/dev/null
+          useradd -m builder
+          chown -R builder:builder /pkg
+          su builder -s /bin/bash -c 'updpkgsums && makepkg --printsrcinfo > .SRCINFO'
+          chown -R "$HOST_UID:$HOST_GID" /pkg
+          CTR
+          git --no-pager diff --stat
 
-      - name: Commit and push changes
-        if: steps.check.outputs.update == 'true'
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add PKGBUILD .SRCINFO
-          git commit -m "Update to ${{ steps.check.outputs.ver }}"
-          git push
-
+      # Unconditional on purpose. Gating this on `update` let one AUR outage strand the
+      # package forever: the GitHub push had already advanced pkgver, so every later run
+      # read update=false and skipped the publish. It self-noops when the AUR is in sync.
       - name: Publish to AUR
-        if: steps.check.outputs.update == 'true'
         env:
           AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
           AUR_USERNAME: ${{ secrets.AUR_USERNAME }}
           AUR_EMAIL: ${{ secrets.AUR_EMAIL }}
         run: |
+          set -Eeuo pipefail
+          umask 077
           mkdir -p ~/.ssh
-          echo "$AUR_SSH_PRIVATE_KEY" > ~/.ssh/aur
-          chmod 600 ~/.ssh/aur
-          ssh-keyscan -t rsa,ecdsa,ed25519 aur.archlinux.org >> ~/.ssh/known_hosts 2>/dev/null
-          cat >> ~/.ssh/config <<'SSHEOF'
+
+          # install -m 600 /dev/stdin lands the key at mode 600 in one step; `> file` then
+          # `chmod` is world-readable for the write window. The CR strip keeps a CRLF-pasted
+          # secret from surfacing much later at push time as an opaque auth error.
+          printf '%s\n' "${AUR_SSH_PRIVATE_KEY//$'\r'/}" | install -m 600 /dev/stdin ~/.ssh/aur
+          ssh-keygen -y -f ~/.ssh/aur >/dev/null
+
+          # Pinned host keys. ssh-keyscan at runtime is TOFU: it trusts whatever answers on
+          # first connect. Fingerprints verified against https://aur.archlinux.org/
+          #   ed25519  SHA256:RFzBCUItH9LZS0cKB5UE6ceAYhBD5C8GeOBip8Z11+4
+          #   rsa      SHA256:5s5cIyReIfNNVGRFdDbe3hdYiI5OelHGpw2rOUud3Q8
+          install -m 600 /dev/stdin ~/.ssh/known_hosts <<'PIN'
+          aur.archlinux.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEuBKrPzbawxA/k2g6NcyV5jmqwJ2s+zpgZGZ7tpLIcN
+          aur.archlinux.org ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQDKF9vAFWdgm9Bi8uc+tYRBmXASBb5cB5iZsB7LOWWFeBrLp3r14w0/9S2vozjgqY5sJLDPONWoTTaVTbhe3vwO8CBKZTEt1AcWxuXNlRnk9FliR1/eNB9uz/7y1R0+c1Md+P98AJJSJWKN12nqIDIhjl2S1vOUvm7FNY43fU2knIhEbHybhwWeg+0wxpKwcAd/JeL5i92Uv03MYftOToUijd1pqyVFdJvQFhqD4v3M157jxS5FTOBrccAEjT+zYmFyD8WvKUa9vUclRddNllmBJdy4NyLB8SvVZULUPrP3QOlmzemeKracTlVOUG1wsDbxknF1BwSCU7CmU6UFP90kpWIyz66bP0bl67QAvlIc52Yix7pKJPbw85+zykvnfl2mdROsaT8p8R9nwCdFsBc9IiD0NhPEHcyHRwB8fokXTajk2QnGhL+zP5KnkmXnyQYOCUYo3EKMXIlVOVbPDgRYYT/XqvBuzq5S9rrU70KoI/S5lDnFfx/+lPLdtcnnEPk=
+          PIN
+
+          install -m 600 /dev/stdin ~/.ssh/config <<'SSH'
           Host aur.archlinux.org
-            IdentityFile ~/.ssh/aur
             User aur
-          SSHEOF
-          git clone ssh://aur@aur.archlinux.org/zluda-preview-bin.git /tmp/aur-repo
+            IdentityFile ~/.ssh/aur
+            IdentitiesOnly yes
+            StrictHostKeyChecking yes
+          SSH
+
+          retry() {
+            local n=1
+            until "$@"; do
+              if [[ $n -ge 4 ]]; then return 1; fi
+              echo "attempt $n failed, retrying in $((n * 30))s"
+              sleep $((n * 30))
+              n=$((n + 1))
+            done
+          }
+          clone_aur() {
+            rm -rf /tmp/aur-repo
+            git clone ssh://aur@aur.archlinux.org/zluda-preview-bin.git /tmp/aur-repo
+          }
+          # The AUR takes short maintenance windows that read as a hard clone failure.
+          retry clone_aur
+
           cp PKGBUILD .SRCINFO /tmp/aur-repo/
           cd /tmp/aur-repo
           git config user.name "$AUR_USERNAME"
           git config user.email "$AUR_EMAIL"
           git add PKGBUILD .SRCINFO
-          git diff --cached --quiet && echo "No changes to commit" && exit 0
-          git commit -m "Update to ${{ steps.check.outputs.ver }}"
-          git push
+          if git diff --cached --quiet; then
+            echo "AUR already in sync"
+            exit 0
+          fi
+          # Message reads the tree, not the check step, so a repair run after an outage
+          # still names the version it is publishing.
+          ver=$(grep '^pkgver=' PKGBUILD | cut -d= -f2)
+          git commit -m "Update to $ver"
+          retry git push
+
+      # Last, so main never advertises a version the AUR does not have.
+      - name: Commit and push changes
+        if: steps.check.outputs.update == 'true'
+        env:
+          VER: ${{ steps.check.outputs.ver }}
+        run: |
+          set -Eeuo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add PKGBUILD .SRCINFO
+          if git diff --cached --quiet; then
+            echo "nothing to commit"
+            exit 0
+          fi
+          git commit -m "Update to $VER"
+          pushed=0
+          for _ in 1 2 3; do
+            if git push origin "HEAD:$GITHUB_REF_NAME"; then pushed=1; break; fi
+            # Rebasing drops the commit outright when the tip already carries the change.
+            git pull --rebase origin "$GITHUB_REF_NAME"
+          done
+          if [[ $pushed -ne 1 ]]; then
+            echo "::error::push to $GITHUB_REF_NAME failed after 3 attempts"
+            exit 1
+          fi
