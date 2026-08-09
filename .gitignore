@@ -1,0 +1,8 @@
+# makepkg build output
+src/
+pkg/
+*.pkg.tar.*
+
+# sources updpkgsums fetches into the workspace
+*.tar.gz
+LICENSE-MIT
