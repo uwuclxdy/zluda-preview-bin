@@ -2,7 +2,7 @@
 
 pkgname=zluda-preview-bin
 pkgver=7.preview.6
-pkgrel=1
+pkgrel=2
 pkgdesc='CUDA on AMD GPUs (pre-release ZLUDA binary).'
 arch=('x86_64')
 url='https://github.com/vosen/ZLUDA'
@@ -28,6 +28,14 @@ package() {
 
     install -dm755 "${pkgdir}/usr/lib/zluda"
     cp -dr --no-preserve=ownership zluda/trace zluda/trace_nvidia "${pkgdir}/usr/lib/zluda/"
+
+    # Upstream writes these links relative to its own zluda/ dir. The real libraries land a
+    # level higher than that here, so every target needs one more ../ to resolve.
+    for _l in "${pkgdir}"/usr/lib/zluda/{trace,trace_nvidia}/*; do
+        if [[ -L $_l ]]; then
+            ln -sfn "../$(readlink "$_l")" "$_l"
+        fi
+    done
 
     install -Dm755 zluda/zluda_ld         "${pkgdir}/usr/bin/zluda_ld"
     install -Dm755 zluda/ptxas            "${pkgdir}/usr/bin/ptxas"

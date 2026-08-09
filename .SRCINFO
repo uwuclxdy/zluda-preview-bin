@@ -1,7 +1,7 @@
 pkgbase = zluda-preview-bin
 	pkgdesc = CUDA on AMD GPUs (pre-release ZLUDA binary).
 	pkgver = 7.preview.6
-	pkgrel = 1
+	pkgrel = 2
 	url = https://github.com/vosen/ZLUDA
 	arch = x86_64
 	license = Apache-2.0 OR MIT
