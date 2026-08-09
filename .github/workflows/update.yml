@@ -95,7 +95,7 @@ jobs:
           # per-tag LICENSE-MIT hash stale the first time upstream touches that file.
           docker run --rm -i -v "$PWD:/pkg" -w /pkg \
             -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
-            archlinux:latest bash -Eeuo pipefail -s <<'CTR'
+            archlinux:base-devel bash -Eeuo pipefail -s <<'CTR'
           pacman -Syu --noconfirm --needed pacman-contrib >/dev/null
           useradd -m builder
           chown -R builder:builder /pkg
@@ -103,6 +103,29 @@ jobs:
           chown -R "$HOST_UID:$HOST_GID" /pkg
           CTR
           git --no-pager diff --stat
+
+      # Warn-only per the AUR conventions. It reuses the image the previous step already
+      # pulled, and a dispatch runs it even when there is no version bump to lint.
+      - name: Lint with namcap
+        if: steps.check.outputs.update == 'true' || github.event_name == 'workflow_dispatch'
+        continue-on-error: true
+        run: |
+          set -Eeuo pipefail
+          docker run --rm -i -v "$PWD:/pkg" -w /pkg \
+            -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+            archlinux:base-devel bash -Eeuo pipefail -s <<'CTR'
+          pacman -Syu --noconfirm --needed namcap >/dev/null
+          useradd -m builder
+          chown -R builder:builder /pkg
+          # --nodeps: the ROCm deps are multi-GB and this package() only copies files.
+          # namcap still reports them as uninstalled, which is the expected trade.
+          su builder -s /bin/bash -c 'makepkg --nodeps --noconfirm -f' >/dev/null
+          echo "--- namcap PKGBUILD ---"
+          namcap PKGBUILD || true
+          echo "--- namcap package ---"
+          namcap ./*.pkg.tar.zst || true
+          chown -R "$HOST_UID:$HOST_GID" /pkg
+          CTR
 
       # Unconditional on purpose. Gating this on `update` let one AUR outage strand the
       # package forever: the GitHub push had already advanced pkgver, so every later run
